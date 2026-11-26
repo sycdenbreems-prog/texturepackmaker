@@ -525,7 +525,7 @@ async function entry(kind,name){
   if(kind==='tex'){
    e.els=[sheet(name)];
   }else{
-   let mid='item/'+name,vu=null,bsv=false,parts=null,yrot=0,xrot=0;
+   let mid='item/'+name,vu=null,bsv=false,parts=null,yrot=0,xrot=0,altM=[];
    if(kind==='item'){let idef=PACKJ.get('items/'+name+'.json');if(!idef)idef=await jget('items/'+name+'.json').catch(()=>null);const im=idef&&itemModelOf(idef.model||idef);if(im)mid=im}
    if(kind==='block'){
     const bs=await jget('blockstates/'+name+'.json');
@@ -543,6 +543,7 @@ async function entry(kind,name){
     }
     if(Array.isArray(v))v=v[0];
     mid=v.model;yrot=v.y||0;xrot=v.x||0;
+    if(bs.variants){const ss=new Set();Object.values(bs.variants).forEach(q=>(Array.isArray(q)?q:[q]).forEach(o=>{if(o&&o.model)ss.add(nid(o.model))}));altM=[...ss].filter(x=>x!==nid(mid))}
    }
    if(parts&&parts.length>1){
     for(const ap of parts){
@@ -569,7 +570,7 @@ async function entry(kind,name){
       });
       e.tall=true;
      }
-     if(kind==='block'&&bsv&&!e.tall&&e.els.length&&!yrot&&!xrot){e.canModel=true;e.mid=nid(mid);e.rawModel=m.own;e.rawEls=m.els}
+     if(kind==='block'&&bsv&&!e.tall&&e.els.length&&!yrot&&!xrot){e.canModel=true;e.mid=nid(mid);e.rawModel=m.own;e.rawEls=m.els;e.alt=altM}
     }else{
      const ps=[];
      for(let i=0;m.tex['layer'+i];i++){const p=m.res('#layer'+i);if(p)ps.push(p)}
@@ -1857,8 +1858,20 @@ function atlas(s,l){
  ['u','d','l','r'].forEach((k,i)=>x.drawImage(l.sd[k],(i+1)*W,0));
  return c;
 }
+/* Vlakrotatie (rotation in het model): pixel (x,y) van de texture ligt op het vlak op (X,Y). Alleen voor vierkante textures met volledige uv. */
+const RM={90:{r:'u',d:'r',l:'d',u:'l'},180:{r:'l',l:'r',u:'d',d:'u'},270:{u:'r',r:'d',d:'l',l:'u'}};
+const toF=(x,y,w,h,r)=>r===90?[w-1-y,x]:r===180?[w-1-x,h-1-y]:[y,h-1-x];
+const fromF=(X,Y,w,h,r)=>r===90?[Y,w-1-X]:r===180?[w-1-X,h-1-Y]:[h-1-Y,X];
+function rotHM(hm,w,h,r){
+ const n=w*h,owner=new Int16Array(n).fill(-1),elev=new Float32Array(n),segs=new Array(n);
+ for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+  const p=toF(x,y,w,h,r),j=p[1]*w+p[0],i=y*w+x;
+  owner[j]=hm.owner[i];elev[j]=hm.elev[i];segs[j]=hm.segs[i];
+ }
+ return{owner,elev,segs,holes:hm.holes};
+}
 /* Het blokvlak zelf krijgt gaten waar een laag in de diepte gaat: de originele vlak-face wordt vervangen door strookjes eromheen */
-function strips(out,s,hm,f,dim,ctr,uv,orig,rot,own){
+function strips(out,s,hm,f,dim,ctr,uv,orig,rot,own,r){
  const {U,T,N}=FD[f],[FU,FT,SN]=fsz(f,...dim),[a,b,c,d]=uv,du=c-a,dv=d-b;
  if(!du||!dv)return false;
  const w=s.w,h=s.h;
@@ -1873,10 +1886,16 @@ function strips(out,s,hm,f,dim,ctr,uv,orig,rot,own){
    const cnt=run.x1-run.x0+1,um=(fu(run.x0)+fu(run.x1))/2,v=fv(y);
    const cen=[0,1,2].map(k=>ctr[k]+N[k]*SN/2+U[k]*(um-.5)*FU+T[k]*(.5-v)*FT);
    const half=[0,1,2].map(k=>Math.abs(U[k])*cnt*hu+Math.abs(T[k])*ht);
-   const l0=run.x0/w*16,r0=(run.x1+1)/w*16,t0=y/h*16,t1=(y+1)/h*16;
    const face={...orig};
-   face.uv=[R4(sx>0?l0:r0),R4(sy>0?t0:t1),R4(sx>0?r0:l0),R4(sy>0?t1:t0)];
-   delete face.rotation;
+   if(r){
+    const pa=fromF(run.x0,y,w,h,r),pb=fromF(run.x1,y,w,h,r);
+    face.uv=[R4(Math.min(pa[0],pb[0])/w*16),R4(Math.min(pa[1],pb[1])/h*16),R4((Math.max(pa[0],pb[0])+1)/w*16),R4((Math.max(pa[1],pb[1])+1)/h*16)];
+    face.rotation=r;
+   }else{
+    const l0=run.x0/w*16,r0=(run.x1+1)/w*16,t0=y/h*16,t1=(y+1)/h*16;
+    face.uv=[R4(sx>0?l0:r0),R4(sy>0?t0:t1),R4(sx>0?r0:l0),R4(sy>0?t1:t0)];
+    delete face.rotation;
+   }
    const el={from:cen.map((q,k)=>R4(q-half[k])),to:cen.map((q,k)=>R4(q+half[k])),faces:{[vname(N)]:face}};
    if(rot)el.rotation=rot;
    out.push(el);run=null;
@@ -1891,48 +1910,107 @@ function strips(out,s,hm,f,dim,ctr,uv,orig,rot,own){
  }
  return any;
 }
-async function exportModel(en,z){
- eachSlotOf(en,s=>s.layers.forEach(l=>{if(is3d(l)&&l.vis)syncSides(s,l)}));
- const out=[],tmap={},done=new Set(),HM={},atl=[],MA=calcMaxA(en.els,en.slots);
- const raw=JSON.parse(JSON.stringify(en.rawEls||[]));
- for(const el of en.els){
-  const [x1,y1,z1]=el.from,[x2,y2,z2]=el.to,dim=[x2-x1,y2-y1,z2-z1],ctr=[(x1+x2)/2,(y1+y2)/2,(z1+z2)/2];
-  for(const f in el.faces){
-   const F=el.faces[f],s=en.slots[F.path];
-   if(!s.layers.some(l=>is3d(l)&&l.vis))continue;
-   const hm=HM[F.path]||(HM[F.path]=heightmap(s));
-   if(!hm.owner.some(v=>v>=0))continue;
-   const ownF=ownFn(s,F.uv,MA);
-   walk(s,hm,f,dim,F.uv,1,.01,q=>{
-    const l=s.layers[q.li],key='bs_'+safe(en.name+'_'+F.path)+'_l'+(q.li+1);
-    if(!done.has(key)){
-     done.add(key);tmap[key]='block/'+key;
-     ensureSides(s,l);
-     atl.push([key,atlas(s,l)]);
+/* Voegt kleine pixelvlakjes samen tot langere stroken (veel minder elementen = veel minder lag in Minecraft) */
+function makeMerger(out){
+ const open=new Map(),eq=(a,b)=>Math.abs(a-b)<1e-3;
+ const fin=c=>{
+  const n=c.n,W=c.W,H=c.H,AW=5*W,k=PIDX[c.part],e=.003;
+  let u1=(k*W+c.x0*n)/AW*16+e,u2=(k*W+(c.x1+1)*n)/AW*16-e,v1=c.y0*n/H*16+e,v2=(c.y1+1)*n/H*16-e;
+  if(c.d!==undefined&&!c.fr){
+   const F=FD[c.fname];
+   if(c.runX){if(c.d*F.U[c.k]<0){const t=u1;u1=u2;u2=t}}
+   else{if(c.d*F.T[c.k]>0){const t=v1;v1=v2;v2=t}}
+  }
+  const fc={uv:[R4(u1),R4(v1),R4(u2),R4(v2)],texture:'#'+c.key};
+  if(c.fr&&c.kind==='top')fc.rotation=c.fr;
+  const g={from:c.from.map(R4),to:c.to.map(R4),faces:{[c.fname]:fc}};
+  if(c.rot)g.rotation=c.rot;
+  out.push(g);
+ };
+ const add=q=>{
+  const F=FD[q.fname],runX=q.kind==='top'||q.part==='u'||q.part==='d';
+  q.runX=runX;q.x0=q.x1=q.tx;q.y0=q.y1=q.ty;q.last=runX?q.fx:q.fy;
+  const canMerge=q.kind==='top'||!q.fr;
+  const sig=[q.eid,q.key,q.part,q.kind,q.fname,runX?'y'+q.fy:'x'+q.fx].join('|');
+  const c=open.get(sig);
+  if(c&&canMerge&&c.last===(runX?q.fx:q.fy)-1){
+   let k=-1,ok=true;
+   for(let i=0;i<3;i++){
+    if(eq(c.from[i],q.from[i])&&eq(c.to[i],q.to[i]))continue;
+    if(k>=0){ok=false;break}
+    k=i;
+   }
+   if(ok&&k>=0){
+    const d=eq(q.from[k],c.to[k])?1:eq(q.to[k],c.from[k])?-1:0;
+    const al=runX?F.U[k]:F.T[k];
+    if(d&&al&&(c.d===undefined||c.d===d)){
+     c.d=d;c.k=k;c.last++;
+     c.from=c.from.map((v,i)=>Math.min(v,q.from[i]));c.to=c.to.map((v,i)=>Math.max(v,q.to[i]));
+     c.x0=Math.min(c.x0,q.tx);c.x1=Math.max(c.x1,q.tx);c.y0=Math.min(c.y0,q.ty);c.y1=Math.max(c.y1,q.ty);
+     return;
     }
-    const n=l.N,W=s.w*n,H=s.h*n,AW=5*W,k=PIDX[q.part];
-    const uvv=[R4((k*W+q.x*n)/AW*16),R4(q.y*n/H*16),R4((k*W+q.x*n+n)/AW*16),R4((q.y*n+n)/H*16)];
-    const g={from:q.cen.map((v,i)=>R4(ctr[i]+v-q.half[i])),to:q.cen.map((v,i)=>R4(ctr[i]+v+q.half[i])),faces:{[q.fname]:{uv:uvv,texture:'#'+key}}};
-    if(el.rot)g.rotation=el.rot;
-    out.push(g);
-   },ownF);
-   /* gaten in het blokvlak */
-   const rf=raw[el.ri]&&raw[el.ri].faces&&raw[el.ri].faces[f];
-   if(rf&&hm.holes){
-    const tmp=[];
-    if(strips(tmp,s,hm,f,dim,ctr,F.uv,rf,el.rot,ownF)){out.push(...tmp);delete raw[el.ri].faces[f]}
    }
   }
+  if(c)fin(c);
+  open.set(sig,q);
+ };
+ const flush=()=>{open.forEach(fin);open.clear()};
+ return{add,flush};
+}
+async function exportModel(en,z){
+ eachSlotOf(en,s=>s.layers.forEach(l=>{if(is3d(l)&&l.vis)syncSides(s,l)}));
+ const done=new Set(),HM={},atl=[],models=[];let total=0;
+ const ids=[en.mid,...(en.alt||[])];
+ for(const id of ids){
+  let els,rawM,rawE;
+  if(id===en.mid){els=en.els;rawM=en.rawModel;rawE=en.rawEls}
+  else{
+   let m;try{m=await model(id)}catch(e){continue}
+   if(!m.els)continue;
+   rawM=m.own;rawE=m.els;
+   els=m.els.map((el,ri)=>({...norm(el,m.res),ri})).filter(el=>Object.keys(el.faces).length);
+  }
+  const out=[],tmap={},raw=JSON.parse(JSON.stringify(rawE||[])),MA=calcMaxA(els,en.slots),mg=makeMerger(out);
+  for(const el of els){
+   const [x1,y1,z1]=el.from,[x2,y2,z2]=el.to,dim=[x2-x1,y2-y1,z2-z1],ctr=[(x1+x2)/2,(y1+y2)/2,(z1+z2)/2];
+   for(const f in el.faces){
+    const F=el.faces[f],s=en.slots[F.path];
+    if(!s||!s.layers.some(l=>is3d(l)&&l.vis))continue;
+    const hm0=HM[F.path]||(HM[F.path]=heightmap(s));
+    if(!hm0.owner.some(v=>v>=0))continue;
+    const w=s.w,h=s.h,uf=F.uv;
+    const r=(F.rot&&w===h&&uf[0]===0&&uf[1]===0&&uf[2]===16&&uf[3]===16&&RM[F.rot])?F.rot:0;
+    const hm=r?rotHM(hm0,w,h,r):hm0,ownT=ownFn(s,F.uv,MA);
+    const ownF=ownT&&r?((X,Y)=>{const p=fromF(X,Y,w,h,r);return ownT(p[0],p[1])}):ownT;
+    const eid=el.ri+'|'+f;
+    walk(s,hm,f,dim,F.uv,1,.01,q=>{
+     let tx=q.x,ty=q.y,part=q.part;
+     if(r){const p=fromF(q.x,q.y,w,h,r);tx=p[0];ty=p[1];if(part!=='t')part=RM[r][part]}
+     const l=s.layers[q.li],key='bs_'+safe(en.name+'_'+F.path)+'_l'+(q.li+1);
+     if(!done.has(key)){done.add(key);ensureSides(s,l);atl.push([key,atlas(s,l)])}
+     tmap[key]='block/'+key;
+     mg.add({eid,key,part,kind:q.kind,fname:q.fname,fx:q.x,fy:q.y,tx,ty,fr:r,n:l.N,W:s.w*l.N,H:s.h*l.N,
+      from:q.cen.map((v,i)=>ctr[i]+v-q.half[i]),to:q.cen.map((v,i)=>ctr[i]+v+q.half[i]),rot:el.rot});
+    },ownF);
+    /* gaten in het blokvlak */
+    const rf=raw[el.ri]&&raw[el.ri].faces&&raw[el.ri].faces[f];
+    if(rf&&hm.holes){
+     const tmp=[];
+     if(strips(tmp,s,hm,f,dim,ctr,F.uv,rf,el.rot,ownF,r)){out.push(...tmp);delete raw[el.ri].faces[f]}
+    }
+   }
+  }
+  mg.flush();
+  if(!out.length)continue;
+  const m=JSON.parse(JSON.stringify(rawM||{}));
+  m.elements=[...raw,...out];
+  m.textures={...(m.textures||{}),...tmap};
+  models.push([id,m]);total+=out.length;
  }
- if(!out.length)return 0;
- for(const [key,cv] of atl){
-  z.file('assets/minecraft/textures/block/'+key+'.png',await toBlob(cv));
- }
- const m=JSON.parse(JSON.stringify(en.rawModel||{}));
- m.elements=[...raw,...out];
- m.textures={...(m.textures||{}),...tmap};
- z.file('assets/minecraft/models/'+en.mid+'.json',JSON.stringify(m));
- return out.length;
+ if(!total)return 0;
+ for(const [key,cv] of atl)z.file('assets/minecraft/textures/block/'+key+'.png',await toBlob(cv));
+ for(const [id,m] of models)z.file('assets/minecraft/models/'+id+'.json',JSON.stringify(m));
+ return total;
 }
 function eachSlotOf(en,f){Object.values(en.slots).forEach(f)}
 function hasRaised(en){
